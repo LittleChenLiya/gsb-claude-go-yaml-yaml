@@ -325,6 +325,9 @@ type decoder struct {
 	aliasDepth  int
 
 	mergedFields map[interface{}]bool
+
+	ledger *FieldLedger
+	onDone func(*FieldLedger)
 }
 
 var (
@@ -348,6 +351,9 @@ func newDecoder() *decoder {
 }
 
 func (d *decoder) terror(n *Node, tag string, out reflect.Value) {
+	if d.ledger != nil {
+		d.ledger.stop(n)
+	}
 	if n.Tag != "" {
 		tag = n.Tag
 	}
@@ -362,13 +368,60 @@ func (d *decoder) terror(n *Node, tag string, out reflect.Value) {
 	d.terrors = append(d.terrors, fmt.Sprintf("line %d: cannot unmarshal %s%s into %s", n.Line, shortTag(tag), value, out.Type()))
 }
 
+// markConsumed records that a key node was consumed in the ledger,
+// when one is active.
+func (d *decoder) markConsumed(n *Node, kind ConsumptionKind) {
+	if d.ledger == nil {
+		return
+	}
+	d.ledger.mark(n, kind)
+}
+
+// setLedgerOnTree attaches the active ledger to every node in the
+// decoded tree so custom unmarshalers can mark consumed keys via
+// Node.MarkConsumed.
+func (d *decoder) setLedgerOnTree(n *Node) {
+	if n == nil {
+		return
+	}
+	n.ledger = d.ledger
+	for _, c := range n.Content {
+		d.setLedgerOnTree(c)
+	}
+	if n.Alias != nil {
+		d.setLedgerOnTree(n.Alias)
+	}
+}
+
+// clearLedgerOnTree removes the active ledger from every node in the
+// decoded tree after decoding, so nodes are not left with stale
+// references.
+func (d *decoder) clearLedgerOnTree(n *Node) {
+	if n == nil {
+		return
+	}
+	n.ledger = nil
+	for _, c := range n.Content {
+		d.clearLedgerOnTree(c)
+	}
+	if n.Alias != nil {
+		d.clearLedgerOnTree(n.Alias)
+	}
+}
+
 func (d *decoder) callUnmarshaler(n *Node, u Unmarshaler) (good bool) {
 	err := u.UnmarshalYAML(n)
 	if e, ok := err.(*TypeError); ok {
 		d.terrors = append(d.terrors, e.Errors...)
+		if d.ledger != nil {
+			d.ledger.stop(n)
+		}
 		return false
 	}
 	if err != nil {
+		if d.ledger != nil {
+			d.ledger.stop(n)
+		}
 		fail(err)
 	}
 	return true
@@ -388,9 +441,15 @@ func (d *decoder) callObsoleteUnmarshaler(n *Node, u obsoleteUnmarshaler) (good 
 	})
 	if e, ok := err.(*TypeError); ok {
 		d.terrors = append(d.terrors, e.Errors...)
+		if d.ledger != nil {
+			d.ledger.stop(n)
+		}
 		return false
 	}
 	if err != nil {
+		if d.ledger != nil {
+			d.ledger.stop(n)
+		}
 		fail(err)
 	}
 	return true
@@ -922,10 +981,12 @@ func (d *decoder) mappingStruct(n *Node, out reflect.Value) (good bool) {
 			if d.uniqueKeys {
 				if doneFields[info.Id] {
 					d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s already set in type %s", ni.Line, name.String(), out.Type()))
+					d.markConsumed(ni, ConsumedByStruct)
 					continue
 				}
 				doneFields[info.Id] = true
 			}
+			d.markConsumed(ni, ConsumedByStruct)
 			var field reflect.Value
 			if info.Inline == nil {
 				field = out.Field(info.Num)
@@ -940,8 +1001,12 @@ func (d *decoder) mappingStruct(n *Node, out reflect.Value) (good bool) {
 			value := reflect.New(elemType).Elem()
 			d.unmarshal(n.Content[i+1], value)
 			inlineMap.SetMapIndex(name, value)
-		} else if d.knownFields {
-			d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s not found in type %s", ni.Line, name.String(), out.Type()))
+			d.markConsumed(ni, ConsumedByStruct)
+		} else {
+			d.markConsumed(ni, NotConsumed)
+			if d.knownFields {
+				d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s not found in type %s", ni.Line, name.String(), out.Type()))
+			}
 		}
 	}
 

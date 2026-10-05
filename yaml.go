@@ -93,6 +93,8 @@ func Unmarshal(in []byte, out interface{}) (err error) {
 type Decoder struct {
 	parser      *parser
 	knownFields bool
+	ledger      *FieldLedger
+	onDone      func(*FieldLedger)
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -111,6 +113,20 @@ func (dec *Decoder) KnownFields(enable bool) {
 	dec.knownFields = enable
 }
 
+// SetLedger sets the ledger that records field consumption during
+// decoding. By default no ledger is kept.
+func (dec *Decoder) SetLedger(l *FieldLedger) {
+	dec.ledger = l
+}
+
+// OnDone sets a callback that is invoked exactly once after decoding,
+// with the field consumption ledger. It is not invoked when no ledger
+// is set. The ledger's Done method reports whether decoding completed
+// successfully.
+func (dec *Decoder) OnDone(fn func(*FieldLedger)) {
+	dec.onDone = fn
+}
+
 // Decode reads the next YAML-encoded value from its input
 // and stores it in the value pointed to by v.
 //
@@ -119,16 +135,36 @@ func (dec *Decoder) KnownFields(enable bool) {
 func (dec *Decoder) Decode(v interface{}) (err error) {
 	d := newDecoder()
 	d.knownFields = dec.knownFields
+	d.ledger = dec.ledger
+	d.onDone = dec.onDone
 	defer handleErr(&err)
 	node := dec.parser.parse()
 	if node == nil {
 		return io.EOF
 	}
+	if d.ledger != nil {
+		d.ledger.reset(node)
+		d.ledger.buildPathMap()
+		d.setLedgerOnTree(node)
+	}
+	completed := false
+	defer func() {
+		if d.ledger != nil {
+			if completed && len(d.terrors) == 0 {
+				d.ledger.finish()
+			}
+			if d.onDone != nil {
+				d.onDone(d.ledger)
+			}
+			d.clearLedgerOnTree(node)
+		}
+	}()
 	out := reflect.ValueOf(v)
 	if out.Kind() == reflect.Ptr && !out.IsNil() {
 		out = out.Elem()
 	}
 	d.unmarshal(node, out)
+	completed = true
 	if len(d.terrors) > 0 {
 		return &TypeError{d.terrors}
 	}
@@ -413,6 +449,24 @@ type Node struct {
 	// These fields are not respected when encoding the node.
 	Line   int
 	Column int
+
+	// ledger is the active consumption ledger during decoding. It is
+	// unexported and only set by the decoder when a ledger is attached.
+	ledger *FieldLedger
+}
+
+// MarkConsumed records that this node was consumed by a custom
+// UnmarshalYAML implementation. It is a no-op when no consumption
+// ledger is active.
+//
+// Custom unmarshalers that consume keys from a mapping node should call
+// MarkConsumed on each consumed key node so the ledger does not report
+// those keys as unknown.
+func (n *Node) MarkConsumed() {
+	if n == nil || n.ledger == nil {
+		return
+	}
+	n.ledger.mark(n, ConsumedByUnmarshal)
 }
 
 // IsZero returns whether the node has all of its fields unset.
