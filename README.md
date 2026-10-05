@@ -160,3 +160,41 @@ b:
   - 4
 ```
 
+
+Read-only parent-reference index
+--------------------------------
+
+`parentindex.go` adds a read-only parent-reference index on top of a
+decoded `Node` tree. The index is a side structure: it never rewrites
+`Node.Content` and never expands aliases into copied subtrees.
+
+- A shared node (several aliases pointing at the same anchor, or several
+  container slots) reports one **actual incoming edge per reference**, and
+  every edge keeps the source path of that particular reference.
+- Content edges (`ContentEdge`, via a parent `Content` slot) and alias
+  edges (`AliasEdge`, via an alias node `Alias` pointer) are tracked
+  separately.
+- Traversal dedupes by node identity, so reference cycles (including a
+  self-referential anchor) terminate instead of expanding forever.
+- The index is bound to a graph baseline. After the graph changes
+  (`Content`, `Alias`, or structure), old queries return
+  `yaml.ErrStaleIndex`; `Invalidate` marks it stale explicitly. Rebuild
+  with `BuildIndex`.
+- The graph root has its own dedicated identity (`Index.RootID`,
+  `Identity.IsRoot`, `Index.IsRoot`) with a synthetic root edge.
+
+Four-node example (`Example_fourNodeParentIndex` in
+`parentindex_test.go`): a sequence root containing one alias and one plain
+scalar, where the alias points at a fourth (anchored, shared) scalar:
+
+```
+root sequence   ──content[0]──▶ alias *v ──alias──▶ scalar v (anchor v, shared)
+                ──content[1]──▶ scalar v
+```
+
+The targeted acceptance command is:
+
+```
+go test -run 'TestParentIndex|Example_fourNodeParentIndex' -v .
+```
+
