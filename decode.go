@@ -325,6 +325,8 @@ type decoder struct {
 	aliasDepth  int
 
 	mergedFields map[interface{}]bool
+
+	tracker *consumeTracker
 }
 
 var (
@@ -347,6 +349,31 @@ func newDecoder() *decoder {
 	return d
 }
 
+// trackKey records the fate of the mapping key node n in the
+// consumption ledger. It is a no-op when tracking is disabled.
+func (d *decoder) trackKey(n *Node, kind ConsumptionKind) {
+	if d.tracker != nil {
+		d.tracker.record(n, kind)
+	}
+}
+
+// trackPush and trackPop maintain the path of literal keys and
+// sequence indices along the real nodes being decoded, so that
+// recorded entries carry nested map and array paths. They are no-ops
+// when tracking is disabled.
+func (d *decoder) trackPush(seg interface{}) {
+	if d.tracker != nil {
+		d.tracker.path = append(d.tracker.path, seg)
+	}
+}
+
+func (d *decoder) trackPop() {
+	if d.tracker != nil {
+		t := d.tracker
+		t.path = t.path[:len(t.path)-1]
+	}
+}
+
 func (d *decoder) terror(n *Node, tag string, out reflect.Value) {
 	if n.Tag != "" {
 		tag = n.Tag
@@ -363,6 +390,10 @@ func (d *decoder) terror(n *Node, tag string, out reflect.Value) {
 }
 
 func (d *decoder) callUnmarshaler(n *Node, u Unmarshaler) (good bool) {
+	if d.tracker != nil {
+		registerConsumeNode(n, d.tracker)
+		defer unregisterConsumeNode(n)
+	}
 	err := u.UnmarshalYAML(n)
 	if e, ok := err.(*TypeError); ok {
 		d.terrors = append(d.terrors, e.Errors...)
@@ -375,6 +406,10 @@ func (d *decoder) callUnmarshaler(n *Node, u Unmarshaler) (good bool) {
 }
 
 func (d *decoder) callObsoleteUnmarshaler(n *Node, u obsoleteUnmarshaler) (good bool) {
+	if d.tracker != nil {
+		registerConsumeNode(n, d.tracker)
+		defer unregisterConsumeNode(n)
+	}
 	terrlen := len(d.terrors)
 	err := u.UnmarshalYAML(func(v interface{}) (err error) {
 		defer handleErr(&err)
@@ -483,6 +518,11 @@ func allowedAliasRatio(decodeCount int) float64 {
 
 func (d *decoder) unmarshal(n *Node, out reflect.Value) (good bool) {
 	d.decodeCount++
+	if d.tracker != nil {
+		// Remember the real node being decoded so a failure can be
+		// reported at the node where decoding actually stopped.
+		d.tracker.stop = n
+	}
 	if d.aliasDepth > 0 {
 		d.aliasCount++
 	}
@@ -750,7 +790,10 @@ func (d *decoder) sequence(n *Node, out reflect.Value) (good bool) {
 	j := 0
 	for i := 0; i < l; i++ {
 		e := reflect.New(et).Elem()
-		if ok := d.unmarshal(n.Content[i], e); ok {
+		d.trackPush(i)
+		ok := d.unmarshal(n.Content[i], e)
+		d.trackPop()
+		if ok {
 			out.Index(j).Set(e)
 			j++
 		}
@@ -845,9 +888,12 @@ func (d *decoder) mapping(n *Node, out reflect.Value) (good bool) {
 				failf("invalid map key: %#v", k.Interface())
 			}
 			e := reflect.New(et).Elem()
+			d.trackKey(n.Content[i], KeyMapKey)
+			d.trackPush(n.Content[i].Value)
 			if d.unmarshal(n.Content[i+1], e) || n.Content[i+1].ShortTag() == nullTag && (mapIsNew || !out.MapIndex(k).IsValid()) {
 				out.SetMapIndex(k, e)
 			}
+			d.trackPop()
 		}
 	}
 
@@ -919,6 +965,7 @@ func (d *decoder) mappingStruct(n *Node, out reflect.Value) (good bool) {
 			mergedFields[sname] = true
 		}
 		if info, ok := sinfo.FieldsMap[sname]; ok {
+			d.trackKey(ni, KeyStructField)
 			if d.uniqueKeys {
 				if doneFields[info.Id] {
 					d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s already set in type %s", ni.Line, name.String(), out.Type()))
@@ -932,16 +979,24 @@ func (d *decoder) mappingStruct(n *Node, out reflect.Value) (good bool) {
 			} else {
 				field = d.fieldByIndex(n, out, info.Inline)
 			}
+			d.trackPush(ni.Value)
 			d.unmarshal(n.Content[i+1], field)
+			d.trackPop()
 		} else if sinfo.InlineMap != -1 {
+			d.trackKey(ni, KeyStructField)
 			if inlineMap.IsNil() {
 				inlineMap.Set(reflect.MakeMap(inlineMap.Type()))
 			}
 			value := reflect.New(elemType).Elem()
+			d.trackPush(ni.Value)
 			d.unmarshal(n.Content[i+1], value)
+			d.trackPop()
 			inlineMap.SetMapIndex(name, value)
-		} else if d.knownFields {
-			d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s not found in type %s", ni.Line, name.String(), out.Type()))
+		} else {
+			d.trackKey(ni, KeyUnconsumed)
+			if d.knownFields {
+				d.terrors = append(d.terrors, fmt.Sprintf("line %d: field %s not found in type %s", ni.Line, name.String(), out.Type()))
+			}
 		}
 	}
 

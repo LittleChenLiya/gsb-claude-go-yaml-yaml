@@ -93,6 +93,7 @@ func Unmarshal(in []byte, out interface{}) (err error) {
 type Decoder struct {
 	parser      *parser
 	knownFields bool
+	consumeCb   func(*ConsumptionReport)
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -119,6 +120,12 @@ func (dec *Decoder) KnownFields(enable bool) {
 func (dec *Decoder) Decode(v interface{}) (err error) {
 	d := newDecoder()
 	d.knownFields = dec.knownFields
+	if dec.consumeCb != nil {
+		d.tracker = &consumeTracker{cb: dec.consumeCb}
+		// Registered before handleErr so it runs after the error is
+		// settled, and exactly once per Decode call.
+		defer func() { d.tracker.finish(err) }()
+	}
 	defer handleErr(&err)
 	node := dec.parser.parse()
 	if node == nil {
